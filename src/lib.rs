@@ -94,6 +94,9 @@
 #[cfg(test)]
 mod tests;
 
+mod middleware_future;
+use middleware_future::GovernorMiddlewareFuture;
+
 use governor::{
     clock::{Clock, DefaultClock},
     state::keyed::DefaultKeyedStateStore,
@@ -293,7 +296,7 @@ where
     type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+    type Future = middleware_future::GovernorMiddlewareFuture<S>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
@@ -303,39 +306,38 @@ where
         let ip = if let Some(addr) = req.peer_addr() {
             addr.ip()
         } else {
-            return Box::pin(async {
-                Err(error::ErrorInternalServerError(
+            return GovernorMiddlewareFuture::fail_immediately(
+                error::ErrorInternalServerError(
                     "Couldn't find peer address",
-                ))
-            });
+                )
+            );
         };
 
         // clone to prevent moving values into the closure
         let mut srv = self.service.clone();
         let limiter = self.limiter.clone();
 
-        Box::pin(async move {
-            match limiter.check_key(&ip) {
-                Ok(_) => {
-                    let res = srv.call(req).await?;
-                    Ok(res)
-                }
-                Err(negative) => {
-                    let wait_time = negative
-                        .wait_time_from(DefaultClock::default().now())
-                        .as_secs();
-                    log::info!(
-                        "Rate limit exceeded for client-IP [{}], quota reset in {}s",
-                        &ip,
-                        &wait_time
-                    );
-                    let wait_time_str = wait_time.to_string();
-                    let response = actix_web::HttpResponse::TooManyRequests()
-                        .set_header(actix_web::http::header::RETRY_AFTER, wait_time_str.clone())
-                        .body(format!("Too many requests, retry in {}s", wait_time_str));
-                    Err(response.into())
-                }
+        match limiter.check_key(&ip) {
+            Ok(_) => {
+                GovernorMiddlewareFuture::from_future(srv.call(req))
             }
-        })
+            Err(negative) => {
+                let wait_time = negative
+                    .wait_time_from(DefaultClock::default().now())
+                    .as_secs();
+                log::info!(
+                    "Rate limit exceeded for client-IP [{}], quota reset in {}s",
+                    &ip,
+                    &wait_time
+                );
+                let wait_time_str = wait_time.to_string();
+                let response = actix_web::HttpResponse::TooManyRequests()
+                    .set_header(actix_web::http::header::RETRY_AFTER, wait_time_str.clone())
+                    .body(format!("Too many requests, retry in {}s", wait_time_str));
+
+                GovernorMiddlewareFuture::fail_immediately(response.into())
+            }
+        }
     }
 }
+
